@@ -1,9 +1,13 @@
 package rltee
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"syscall"
 
 	"github.com/chzyer/readline"
 	"github.com/iancoleman/strcase"
@@ -17,8 +21,8 @@ import (
 )
 
 type Config struct {
-	History, LogLevel string
-	Buffered, Temp    bool
+	Output, History, Prompt, LogLevel string
+	Buffered, Temp                    bool
 }
 
 var configFile string
@@ -31,14 +35,17 @@ const CommandName = "rltee"
 
 func init() {
 	Command.PersistentFlags().StringVarP(&configFile, "config", "c", "", `config file (default "`+CommandName+`.yml")`)
+	Command.Flags().SetInterspersed(false)
+	Command.Flags().StringP("output", "o", "", "output file")
 	Command.Flags().StringP("history", "H", "", "history file")
-	Command.Flags().StringP("buffered", "b", "", "use buffer for output")
+	Command.Flags().StringP("prompt", "p", "> ", "prompt")
+	Command.Flags().StringP("buffered", "r", "", "use buffer for output")
 	Command.Flags().StringP("temp", "t", "", "use tempfile for output")
 	Command.Flags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
 	Command.Flags().BoolVar(&debug, "debug", false, "debug output")
 	Command.Flags().BoolVarP(&version, "version", "V", false, "show Version")
 
-	for _, s := range []string{"history", "buffered", "temp"} {
+	for _, s := range []string{"output", "history", "prompt", "buffered", "temp"} {
 		envKey := strcase.ToSnake(s)
 		structKey := strcase.ToCamel(s)
 		viper.BindPFlag(envKey, Command.Flags().Lookup(s))
@@ -86,13 +93,18 @@ func Main() {
 	Command.Execute()
 }
 
+var globalExitStatus int
+
 var Command = &cobra.Command{
 	Use:  CommandName + ` [OUTPUT]`,
-	Args: cobra.ExactArgs(1),
+	Args: cobra.ArbitraryArgs,
 	Run: func(cmd *cobra.Command, args []string) {
 		err := run(cmd, args)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if globalExitStatus != 0 {
+			os.Exit(globalExitStatus)
 		}
 	},
 }
@@ -117,7 +129,7 @@ func run(cmd *cobra.Command, args []string) error {
 		log.Debug(pp.Sprint(config))
 	}
 
-	output := args[0]
+	output := config.Output
 
 	opener := osplus.NewOpener()
 	opener.Unbuffered = !config.Buffered
@@ -138,7 +150,7 @@ func run(cmd *cobra.Command, args []string) error {
 		defer w.Close()
 	}
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          "> ",
+		Prompt:          config.Prompt,
 		HistoryFile:     config.History,
 		InterruptPrompt: "^C",
 	})
@@ -147,18 +159,78 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer rl.Close()
 
-	for {
-		line, err := rl.Readline()
+	if len(args) > 0 {
+		ctx := context.Background()
+		globalExitStatus, err = execute(ctx, w, rl, args[0], args[1:])
 		if err != nil {
-			break
+			return err
 		}
-		fmt.Fprintln(w, line)
-		err = rl.SaveHistory(line)
+	} else {
+		err = print(w, rl)
 		if err != nil {
-			log.Warn(err)
+			return err
 		}
 	}
 
 	commit(true)
 	return nil
+}
+
+func print(w io.Writer, rl *readline.Instance) error {
+	for {
+		line, err := rl.Readline()
+		if err != nil {
+			return nil
+		}
+		_, err = fmt.Fprintln(w, line)
+		if err != nil {
+			return err
+		}
+		err = rl.SaveHistory(line)
+		if err != nil {
+			log.Warn(err)
+		}
+	}
+}
+
+func execute(ctx context.Context, w io.Writer, rl *readline.Instance, name string, args []string) (int, error) {
+	log.Debugf("executing %s %v", name, args)
+	cmdCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cmdCtx, name, args...)
+	stdinPipe, err := cmd.StdinPipe()
+	if err != nil {
+		return 0, err
+	}
+	defer stdinPipe.Close()
+	cmd.Stdout = w
+	cmd.Stderr = os.Stderr
+	err = cmd.Start()
+	if err != nil {
+		return 0, err
+	}
+	for {
+		line, err := rl.Readline()
+		if err != nil {
+			if err != io.EOF {
+				log.Info(err)
+			}
+			stdinPipe.Close()
+			err = cmd.Wait()
+			if err2, ok := err.(*exec.ExitError); ok {
+				if s, ok := err2.Sys().(syscall.WaitStatus); ok {
+					return s.ExitStatus(), nil
+				}
+			}
+			return 0, nil
+		}
+		_, err = fmt.Fprintln(stdinPipe, line)
+		if err != nil {
+			return 0, err
+		}
+		err = rl.SaveHistory(line)
+		if err != nil {
+			log.Warn(err)
+		}
+	}
 }
