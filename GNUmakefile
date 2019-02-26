@@ -1,6 +1,6 @@
 .PHONY: build install test fmt coverage dep-init dep-ensure dep-graph pre-commit install-pre-commit
 
-CMD_DIR := cmd/rltee
+CMD_DIR := cmd/rlexec
 
 build:
 	go build -v -ldflags "-s -w"
