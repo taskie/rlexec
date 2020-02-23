@@ -6,149 +6,86 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"syscall"
 
 	"github.com/chzyer/readline"
-	"github.com/iancoleman/strcase"
+	"go.uber.org/zap"
 
-	"github.com/k0kubun/pp"
-	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
-	"github.com/taskie/osplus"
-	"github.com/taskie/rlexec"
-)
-
-type Config struct {
-	Output, History, Prompt, LogLevel string
-	Buffered, Temp                    bool
-}
-
-var configFile string
-var config Config
-var (
-	verbose, debug, version bool
+	"github.com/taskie/fwv"
+	"github.com/taskie/ose"
+	"github.com/taskie/ose/coli"
 )
 
 const CommandName = "rlexec"
 
+var Command *cobra.Command
+
 func init() {
-	Command.PersistentFlags().StringVarP(&configFile, "config", "c", "", `config file (default "`+CommandName+`.yml")`)
-	Command.Flags().SetInterspersed(false)
-	Command.Flags().StringP("output", "o", "", "output file")
-	Command.Flags().StringP("history", "H", "", "history file")
-	Command.Flags().StringP("prompt", "p", "> ", "prompt")
-	Command.Flags().StringP("buffered", "r", "", "use buffer for output")
-	Command.Flags().StringP("temp", "t", "", "use tempfile for output")
-	Command.Flags().BoolVarP(&verbose, "verbose", "v", false, "verbose output")
-	Command.Flags().BoolVar(&debug, "debug", false, "debug output")
-	Command.Flags().BoolVarP(&version, "version", "V", false, "show Version")
-
-	for _, s := range []string{"output", "history", "prompt", "buffered", "temp"} {
-		envKey := strcase.ToSnake(s)
-		structKey := strcase.ToCamel(s)
-		viper.BindPFlag(envKey, Command.Flags().Lookup(s))
-		viper.RegisterAlias(structKey, envKey)
-	}
-
-	cobra.OnInitialize(initConfig)
-}
-
-func initConfig() {
-	if debug {
-		log.SetLevel(log.DebugLevel)
-	} else if verbose {
-		log.SetLevel(log.InfoLevel)
-	} else {
-		log.SetLevel(log.WarnLevel)
-	}
-
-	if configFile != "" {
-		viper.SetConfigFile(configFile)
-	} else {
-		viper.SetConfigName(CommandName)
-		conf, err := osplus.GetXdgConfigHome()
-		if err != nil {
-			log.Info(err)
-		} else {
-			viper.AddConfigPath(filepath.Join(conf, CommandName))
-		}
-		viper.AddConfigPath(".")
-	}
-	viper.SetEnvPrefix(CommandName)
-	viper.AutomaticEnv()
-
-	err := viper.ReadInConfig()
-	if err != nil {
-		log.Debug(err)
-	}
-	err = viper.Unmarshal(&config)
-	if err != nil {
-		log.Warn(err)
-	}
+	Command = NewCommand(coli.NewColiInThisWorld())
 }
 
 func Main() {
 	Command.Execute()
 }
 
-var globalExitStatus int
+func NewCommand(cl *coli.Coli) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:  CommandName,
+		Args: cobra.ArbitraryArgs,
+		Run:  cl.WrapRun(run),
+	}
+	cl.Prepare(cmd)
 
-var Command = &cobra.Command{
-	Use:  CommandName + ` [OUTPUT]`,
-	Args: cobra.ArbitraryArgs,
-	Run: func(cmd *cobra.Command, args []string) {
-		err := run(cmd, args)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if globalExitStatus != 0 {
-			os.Exit(globalExitStatus)
-		}
-	},
+	flg := cmd.Flags()
+	flg.SetInterspersed(false)
+	flg.StringP("output", "o", "", "output file")
+	flg.StringP("history", "H", "", "history file")
+	flg.StringP("prompt", "p", "> ", "prompt")
+	flg.StringP("buffered", "r", "", "use buffer for output")
+	flg.StringP("temp", "t", "", "use tempfile for output")
+
+	cl.BindFlags(flg, []string{"output", "history", "prompt", "buffered", "temp"})
+	return cmd
 }
 
-func run(cmd *cobra.Command, args []string) error {
-	if version {
-		fmt.Println(rlexec.Version)
-		return nil
+type Config struct {
+	Output, History, Prompt, LogLevel string
+	Buffered, Temp                    bool
+}
+
+var globalExitStatus int
+
+func run(cl *coli.Coli, cmd *cobra.Command, args []string) {
+	v := cl.Viper()
+	log := zap.L()
+	if v.GetBool("version") {
+		cmd.Println(fwv.Version)
+		return
 	}
-	if config.LogLevel != "" {
-		lv, err := log.ParseLevel(config.LogLevel)
-		if err != nil {
-			log.Warn(err)
-		} else {
-			log.SetLevel(lv)
-		}
-	}
-	if debug {
-		if viper.ConfigFileUsed() != "" {
-			log.Debugf("Using config file: %s", viper.ConfigFileUsed())
-		}
-		log.Debug(pp.Sprint(config))
+	var config Config
+	err := v.Unmarshal(&config)
+	if err != nil {
+		log.Fatal("can't unmarshal config", zap.Error(err))
 	}
 
 	output := config.Output
 
-	opener := osplus.NewOpener()
+	opener := ose.NewOpenerInThisWorld()
 	opener.Unbuffered = !config.Buffered
-	var w io.WriteCloser
-	var err error
-	commit := func(bool) {}
-	if config.Temp {
-		w, commit, err = opener.CreateTempFileWithDestination(output, "", CommandName+"-")
-		if err != nil {
-			return err
-		}
-		defer w.Close()
-	} else {
-		w, err = opener.Create(output)
-		if err != nil {
-			return err
-		}
-		defer w.Close()
+
+	_, err = opener.CreateTempFile("", CommandName, output, func(f io.WriteCloser) (bool, error) {
+		process(f, args, &config)
+		return true, nil
+	})
+	if err != nil {
+		log.Fatal("can't create file", zap.Error(err))
 	}
+	os.Exit(globalExitStatus)
+}
+
+func process(w io.Writer, args []string, config *Config) {
+	log := zap.L()
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          config.Prompt,
 		HistoryFile:     config.History,
@@ -163,20 +100,18 @@ func run(cmd *cobra.Command, args []string) error {
 		ctx := context.Background()
 		globalExitStatus, err = execute(ctx, w, rl, args[0], args[1:])
 		if err != nil {
-			return err
+			log.Error("execution failed", zap.Error(err))
 		}
 	} else {
 		err = print(w, rl)
 		if err != nil {
-			return err
+			log.Error("print failed", zap.Error(err))
 		}
 	}
-
-	commit(true)
-	return nil
 }
 
 func print(w io.Writer, rl *readline.Instance) error {
+	log := zap.L()
 	for {
 		line, err := rl.Readline()
 		if err != nil {
@@ -188,13 +123,14 @@ func print(w io.Writer, rl *readline.Instance) error {
 		}
 		err = rl.SaveHistory(line)
 		if err != nil {
-			log.Warn(err)
+			log.Warn("can't save history", zap.Error(err))
 		}
 	}
 }
 
 func execute(ctx context.Context, w io.Writer, rl *readline.Instance, name string, args []string) (int, error) {
-	log.Debugf("executing %s %v", name, args)
+	log := zap.L()
+	log.Debug("executing", zap.String("name", name), zap.Strings("args", args))
 	cmdCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(cmdCtx, name, args...)
@@ -213,7 +149,7 @@ func execute(ctx context.Context, w io.Writer, rl *readline.Instance, name strin
 		line, err := rl.Readline()
 		if err != nil {
 			if err != io.EOF {
-				log.Info(err)
+				log.Info("can't read", zap.Error(err))
 			}
 			stdinPipe.Close()
 			err = cmd.Wait()
@@ -230,7 +166,7 @@ func execute(ctx context.Context, w io.Writer, rl *readline.Instance, name strin
 		}
 		err = rl.SaveHistory(line)
 		if err != nil {
-			log.Warn(err)
+			log.Warn("can't save history", zap.Error(err))
 		}
 	}
 }

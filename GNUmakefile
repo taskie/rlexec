@@ -27,7 +27,10 @@ dep-init:
 	dep init
 
 dep-ensure:
-	dep ensure
+	cd $(CMD_DIR) && go mod tidy
+
+dep-update:
+	cd $(CMD_DIR) && go get -u
 
 dep-graph: images/dependency.png
 
