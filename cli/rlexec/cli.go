@@ -74,12 +74,21 @@ func run(cl *coli.Coli, cmd *cobra.Command, args []string) {
 	opener := ose.NewOpenerInThisWorld()
 	opener.Unbuffered = !config.Buffered
 
-	_, err = opener.CreateTempFile("", CommandName, output, func(f io.WriteCloser) (bool, error) {
+	if config.Temp {
+		ok, err := opener.CreateTempFile("", CommandName, output, func(f io.WriteCloser) (bool, error) {
+			process(f, args, &config)
+			return true, nil
+		})
+		if !ok && err != nil {
+			log.Fatal("can't create file", zap.Error(err))
+		}
+	} else {
+		f, err := opener.Create(output)
+		if err != nil {
+			log.Fatal("can't create file", zap.Error(err))
+		}
+		defer f.Close()
 		process(f, args, &config)
-		return true, nil
-	})
-	if err != nil {
-		log.Fatal("can't create file", zap.Error(err))
 	}
 	os.Exit(globalExitStatus)
 }
